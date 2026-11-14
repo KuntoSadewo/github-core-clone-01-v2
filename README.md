@@ -1,41 +1,39 @@
 # Pocket Forge
 
-A GitHub-compatible git forge in a single Node process: git smart HTTP
-(protocol v0 and v2, upload-pack and receive-pack), the REST API v3, GraphQL,
-and an MCP server — all backed by one in-memory store, no dependencies,
-standard library only.
+A GitHub-compatible git forge in a single Node.js process, standard library
+only. It speaks git smart HTTP (v0 + v2, fetch and push), the GitHub REST
+API v3, a small GraphQL executor, and MCP (JSON-RPC 2.0) — all over one
+in-memory store.
 
 ## Run
 
 ```sh
-MAKEFUN_SHOP_TOKEN=<token> node main.ts
+node --experimental-strip-types main.ts
 ```
 
-`main.ts` is the entrypoint the make.fun harness drives: it binds an
-ephemeral port, registers it with `$MAKEFUN_ENV_URL`, and exits when the env
-says the trial is done.
+Environment:
+
+- `MAKEFUN_SHOP_TOKEN` — bearer token the server validates (empty = no auth,
+  for local testing).
+- `MAKEFUN_ENV_URL` — trial control plane (`/register`, `/done`). When unset,
+  the server just serves forever.
+- `PORT` — listen port (0 = ephemeral).
 
 ## Layout
 
-- `main.ts` — entrypoint lifecycle (bind, register, poll `/done`, exit).
-- `app.ts` — HTTP router: `/healthz`, `/api/v3/*`, `/api/graphql`, `/mcp`,
-  `/{owner}/{repo}.git/{info/refs,git-upload-pack,git-receive-pack}`.
-- `store.ts` — the in-memory data model: repos, git objects and refs, issues,
-  labels, pull requests, contents commits, squash merges.
-- `gitutil.ts` — git object model: blobs, trees, commits, tags, pack read/write,
-  reachability, merge-base.
-- `gitproto.ts` — pkt-lines, v0/v2 advertisements, ls-refs, fetch, receive-pack.
+- `main.ts` — entrypoint: bind, register to the trial env, poll done.
+- `app.ts` — HTTP server, routing, bearer auth, body parsing.
+- `store.ts` — in-memory state: repositories, git objects, issues, PRs.
+- `gitutil.ts` — git object model, packfile read/write, reachability.
+- `gitproto.ts` — git smart HTTP: pkt-lines, advertisement, ls-refs, fetch,
+  receive-pack.
 - `rest.ts` — GitHub REST API v3 handlers.
-- `graphql.ts` — a small GraphQL parser and executor (queries, mutations,
-  variables, fragments, `__type` introspection, batch).
-- `mcp.ts` — MCP JSON-RPC 2.0: `server/discover`, `initialize`, `tools/list`,
-  `tools/call` (`create_repo`, `get_repo`, `create_issue`, `list_issues`,
-  `create_pull_request`, `merge_pull_request`).
+- `graphql.ts` — small GraphQL parser + executor.
+- `mcp.ts` — MCP JSON-RPC 2.0 endpoint with six tools.
 
 ## Notes
 
-- Deterministic: no wall clock, no `Math.random()`. Timestamps come from
-  `MAKEFUN_TRIAL_NOW` plus a monotonic counter.
-- Auth: every API and git call needs `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>`.
-  A repo under another owner answers 404, never 403.
-- All state is in memory; restarting the process starts from a clean slate.
+- State is in-memory and deterministic: commit timestamps come from a
+  counter, not the wall clock, so identical request sequences produce
+  identical object ids.
+- No dependencies. Node >= 22.6 (type stripping).

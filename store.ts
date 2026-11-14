@@ -1,604 +1,728 @@
-// store.ts — the forge's whole state: repositories, git objects, issues, pull requests.
-// In-memory only; a trial starts empty. Deterministic timestamps: MAKEFUN_TRIAL_NOW plus a
-// monotonic counter, never the wall clock (the replay must see the same bytes).
+// store.ts — state in-memory forge: repository, objek git, issue, PR.
+//
+// Semua data hidup di memori proses. Tidak ada persistensi: setiap trial
+// dimulai dari store kosong. Timestamp deterministik (counter dari epoch
+// tetap) supaya commit SHA stabil antar run dengan urutan request sama.
 
+import type { GitObject, ObjectKind } from './gitutil.ts';
 import {
-  buildCommit,
-  buildTree,
-  collectReachable,
-  hashObject,
-  isAncestor,
-  parseCommit,
-  parseTag,
-  parseTree,
   ZERO_OID,
-  type GitObject,
+  objectId,
+  encodeCommit,
+  decodeCommit,
+  encodeTree,
+  decodeTree,
+  encodeTag,
+  decodeTag,
+  mergeBase,
+  isAncestor,
+  walkCommits,
+  closureObjects,
+  treeGetPath,
+  treeSetPath,
+  treeRemovePath,
+  treeListDir,
 } from './gitutil.ts';
 
-export const VIEWER = Object.freeze({
-  login: 'adaiversen',
-  id: 1000,
-  name: 'ada iversen',
-  email: 'adaiversen@example.invalid',
-});
-
 export const DEFAULT_BRANCH = 'main';
+const EPOCH_BASE = 1735689600; // 2025-01-01T00:00:00Z — awal counter waktu
 
-export interface Label {
-  id: number;
+// ---------------------------------------------------------------------------
+// Tipe record
+// ---------------------------------------------------------------------------
+
+export interface LabelRecord {
   name: string;
   color: string;
-  description: string;
 }
 
-export interface Comment {
+export interface CommentRecord {
   id: number;
   body: string;
-  createdSeq: number;
-  createdAt: string;
+  seq: number;
 }
 
-export interface Issue {
+export type IssueState = 'open' | 'closed';
+
+export interface IssueRecord {
   id: number;
   number: number;
   title: string;
   body: string;
-  state: 'open' | 'closed';
+  state: IssueState;
   labels: string[];
-  createdSeq: number;
-  createdAt: string;
-  updatedAt: string;
-  comments: Comment[];
+  seq: number;
+  comments: CommentRecord[];
 }
 
-export interface Pull {
+export type PullState = 'open' | 'closed';
+
+export interface PullRecord {
   id: number;
   number: number;
   title: string;
   body: string;
-  state: 'open' | 'closed';
-  headRef: string;
-  baseRef: string;
-  headSha: string;
-  baseSha: string;
+  state: PullState;
   merged: boolean;
   mergedAt: string | null;
   mergeCommitSha: string | null;
-  createdSeq: number;
-  createdAt: string;
-  updatedAt: string;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  baseSha: string;
+  seq: number;
 }
 
-export interface Repo {
+export interface RepoRecord {
   id: number;
-  name: string;
   owner: string;
+  name: string;
   description: string;
-  private: boolean;
+  isPrivate: boolean;
   defaultBranch: string;
-  createdSeq: number;
-  createdAt: string;
-  updatedAt: string;
-  objects: Map<string, GitObject>;
+  seq: number;
   refs: Map<string, string>;
-  labels: Map<string, Label>;
-  issues: Issue[];
-  pulls: Pull[];
-  nextIssueNumber: number;
-  nextPullNumber: number;
+  objects: Map<string, GitObject>;
+  labels: Map<string, LabelRecord>;
+  issues: IssueRecord[];
+  pulls: PullRecord[];
+  /** nomor bersama issue + PR, mulai dari 1 */
+  nextNumber: number;
+  nextCommentId: number;
 }
 
 export interface FileChange {
   path: string;
-  status: 'added' | 'modified' | 'removed';
+  status: 'added' | 'removed' | 'modified';
   oldOid: string | null;
   newOid: string | null;
+  additions: number;
+  deletions: number;
 }
 
-function b64encode(text: string): string {
-  return Buffer.from(text, 'utf8').toString('base64');
-}
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
 
-export function globalId(kind: string, ...parts: Array<string | number>): string {
-  return Buffer.from([kind, ...parts].join(':'), 'utf8').toString('base64');
-}
+export class ForgeStore {
+  private repos = new Map<string, RepoRecord>();
+  private repoSeq = 0;
+  private nextRepoId = 1;
+  private nextIssueId = 1;
+  private nextPullId = 1;
+  private tickCount = 0;
+  private requestSeq = 0;
+  /** login pemilik token; dipelajari dari request pertama, default skenario */
+  private knownViewer: string | null = null;
 
-export function parseGlobalId(id: string): { kind: string; parts: string[] } | null {
-  try {
-    const text = Buffer.from(id, 'base64').toString('utf8');
-    const [kind, ...parts] = text.split(':');
-    if (kind === undefined || kind === '' || parts.length === 0) return null;
-    return { kind, parts };
-  } catch {
-    return null;
-  }
-}
-
-export class Store {
-  readonly repos = new Map<string, Repo>();
-  private nextRepoId = 10000;
-  private nextIssueId = 100000;
-  private nextPullId = 200000;
-  private nextCommentId = 300000;
-  private nextLabelId = 400000;
-  private seq = 0;
-  private readonly baseEpochSec: number;
-
-  constructor() {
-    const now = process.env.MAKEFUN_TRIAL_NOW ?? '';
-    const parsed = now === '' ? NaN : Date.parse(now) / 1000;
-    this.baseEpochSec = Number.isFinite(parsed) ? Math.trunc(parsed) : 1_735_689_600;
+  /** Nomor urut request (untuk X-GitHub-Request-Id yang deterministik). */
+  nextRequestId(): string {
+    this.requestSeq += 1;
+    return `req-${this.requestSeq}`;
   }
 
-  /** The next deterministic timestamp (seconds since epoch), advancing the counter. */
-  nextEpochSec(): number {
-    this.seq += 1;
-    return this.baseEpochSec + this.seq;
+  /** Detik epoch deterministik berikutnya (dipakai commit + created_at). */
+  tick(): number {
+    this.tickCount += 1;
+    return EPOCH_BASE + this.tickCount;
   }
 
-  iso(epochSec: number): string {
-    return new Date(epochSec * 1000).toISOString().replace('.000Z', 'Z');
+  isoNow(): string {
+    return new Date(this.tick() * 1000).toISOString();
   }
 
-  /** A fresh timestamp pair for a created object. */
-  stamp(): { seq: number; epochSec: number; iso: string } {
-    const epochSec = this.nextEpochSec();
-    return { seq: this.seq, epochSec, iso: this.iso(epochSec) };
+  /** Alokasi id numerik unik untuk issue / PR. */
+  allocIssueId(): number {
+    return this.nextIssueId++;
   }
 
-  // ------------------------------------------------------------------ repos
+  allocPullId(): number {
+    return this.nextPullId++;
+  }
 
-  createRepo(name: string, options: { description?: string; private?: boolean }): Repo | null {
-    if (this.repos.has(name)) return null;
-    const stamp = this.stamp();
-    const repo: Repo = {
-      id: this.nextRepoId,
+  /** Catat owner yang terlihat di path; yang pertama menang. */
+  noteOwner(owner: string): void {
+    if (this.knownViewer === null && owner !== '') this.knownViewer = owner;
+  }
+
+  /** Login pemilik token saat ini. */
+  viewerLogin(): string {
+    return this.knownViewer ?? 'adaiversen';
+  }
+
+  private repoKey(owner: string, name: string): string {
+    return `${owner.toLowerCase()}\0${name.toLowerCase()}`;
+  }
+
+  // -- repository -----------------------------------------------------------
+
+  createRepo(
+    name: string,
+    opts: { description?: string; isPrivate?: boolean },
+  ): { repo: RepoRecord; created: boolean } {
+    const owner = this.viewerLogin();
+    const key = this.repoKey(owner, name);
+    const existing = this.repos.get(key);
+    if (existing) return { repo: existing, created: false };
+    this.repoSeq += 1;
+    const repo: RepoRecord = {
+      id: this.nextRepoId++,
+      owner,
       name,
-      owner: VIEWER.login,
-      description: options.description ?? '',
-      private: options.private ?? false,
+      description: opts.description ?? '',
+      isPrivate: opts.isPrivate ?? false,
       defaultBranch: DEFAULT_BRANCH,
-      createdSeq: stamp.seq,
-      createdAt: stamp.iso,
-      updatedAt: stamp.iso,
-      objects: new Map(),
+      seq: this.repoSeq,
       refs: new Map(),
+      objects: new Map(),
       labels: new Map(),
       issues: [],
       pulls: [],
-      nextIssueNumber: 1,
-      nextPullNumber: 1,
+      nextNumber: 1,
+      nextCommentId: 1,
     };
-    this.nextRepoId += 1;
-    this.repos.set(name, repo);
-    return repo;
+    this.repos.set(key, repo);
+    return { repo, created: true };
   }
 
-  getRepo(owner: string, name: string): Repo | undefined {
-    if (owner !== VIEWER.login) return undefined;
-    return this.repos.get(name);
+  getRepo(owner: string, name: string): RepoRecord | undefined {
+    this.noteOwner(owner);
+    return this.repos.get(this.repoKey(owner, name));
   }
 
-  deleteRepo(name: string): boolean {
-    return this.repos.delete(name);
-  }
-
-  listRepos(): Repo[] {
-    return [...this.repos.values()].sort((a, b) => a.createdSeq - b.createdSeq);
-  }
-
-  repoByGlobalId(id: string): Repo | undefined {
-    const parsed = parseGlobalId(id);
-    if (parsed === null || parsed.kind !== 'repo') return undefined;
-    const dbid = Number(parsed.parts[0]);
-    if (!Number.isInteger(dbid)) return undefined;
-    for (const repo of this.repos.values()) if (repo.id === dbid) return repo;
-    return undefined;
-  }
-
-  // ------------------------------------------------------------------ git refs
-
-  refName(branch: string): string {
-    return `refs/heads/${branch}`;
-  }
-
-  branchTip(repo: Repo, branch: string): string | null {
-    return repo.refs.get(this.refName(branch)) ?? null;
-  }
-
-  defaultTip(repo: Repo): string | null {
-    return this.branchTip(repo, repo.defaultBranch);
-  }
-
-  lookup(repo: Repo): (oid: string) => GitObject | undefined {
-    return (oid: string) => repo.objects.get(oid);
-  }
-
-  /** The flat path -> {oid, mode} map of a tree, recursively. */
-  flatTree(repo: Repo, treeOid: string): Map<string, { oid: string; mode: string }> {
-    const out = new Map<string, { oid: string; mode: string }>();
-    const walk = (oid: string, prefix: string): void => {
-      const object = repo.objects.get(oid);
-      if (object === undefined || object.type !== 'tree') return;
-      for (const entry of parseTree(object.data)) {
-        const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-        if (entry.mode === '40000') walk(entry.oid, path);
-        else out.set(path, { oid: entry.oid, mode: entry.mode });
-      }
-    };
-    walk(treeOid, '');
+  /** Semua repo milik satu owner, urutan pembuatan. */
+  listReposByOwner(owner: string): RepoRecord[] {
+    this.noteOwner(owner);
+    const out: RepoRecord[] = [];
+    for (const repo of this.repos.values()) {
+      if (repo.owner.toLowerCase() === owner.toLowerCase()) out.push(repo);
+    }
+    out.sort((a, b) => a.seq - b.seq);
     return out;
   }
 
-  /** Build (and store) the nested trees for a flat path map; returns the root tree oid. */
-  buildTreeFromFlat(repo: Repo, flat: Map<string, { oid: string; mode: string }>): string {
-    interface Node {
-      files: Map<string, { oid: string; mode: string }>;
-      dirs: Map<string, Node>;
+  deleteRepo(owner: string, name: string): boolean {
+    return this.repos.delete(this.repoKey(owner, name));
+  }
+
+  // -- global id (opaque, base64) -------------------------------------------
+
+  repoGlobalId(repo: RepoRecord): string {
+    return Buffer.from(`repo:${repo.owner}/${repo.name}`, 'utf8').toString('base64');
+  }
+
+  issueGlobalId(repo: RepoRecord, issue: IssueRecord): string {
+    return Buffer.from(`issue:${repo.owner}/${repo.name}#${issue.number}`, 'utf8').toString('base64');
+  }
+
+  pullGlobalId(repo: RepoRecord, pull: PullRecord): string {
+    return Buffer.from(`pr:${repo.owner}/${repo.name}#${pull.number}`, 'utf8').toString('base64');
+  }
+
+  commentGlobalId(repo: RepoRecord, issue: IssueRecord, comment: CommentRecord): string {
+    return Buffer.from(
+      `comment:${repo.owner}/${repo.name}#${issue.number}:${comment.id}`,
+      'utf8',
+    ).toString('base64');
+  }
+
+  /** Uraikan global id; mengembalikan jenis + repo + nomor bila cocok. */
+  decodeGlobalId(
+    gid: string,
+  ): { kind: 'repo' | 'issue' | 'pr' | 'comment'; owner: string; name: string; number: number; commentId: number } | null {
+    try {
+      const text = Buffer.from(gid, 'base64').toString('utf8');
+      const match = /^(repo|issue|pr|comment):([^/]+)\/([^#]+)(?:#(\d+))?(?::(\d+))?$/.exec(text);
+      if (match === null) return null;
+      return {
+        kind: match[1] as 'repo' | 'issue' | 'pr' | 'comment',
+        owner: match[2],
+        name: match[3],
+        number: match[4] === undefined ? 0 : Number(match[4]),
+        commentId: match[5] === undefined ? 0 : Number(match[5]),
+      };
+    } catch {
+      return null;
     }
-    const make = (): Node => ({ files: new Map(), dirs: new Map() });
-    const root = make();
-    for (const [path, entry] of [...flat.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
-      const segments = path.split('/');
-      let node = root;
-      for (let i = 0; i < segments.length - 1; i += 1) {
-        const segment = segments[i] as string;
-        if (!node.dirs.has(segment)) node.dirs.set(segment, make());
-        node = node.dirs.get(segment) as Node;
-      }
-      node.files.set(segments[segments.length - 1] as string, entry);
+  }
+
+  // -- objek git --------------------------------------------------------------
+
+  lookup(repo: RepoRecord): (oid: string) => GitObject | undefined {
+    return (oid) => repo.objects.get(oid);
+  }
+
+  storeObject(repo: RepoRecord, kind: ObjectKind, bytes: Buffer): string {
+    const oid = objectId(kind, bytes);
+    if (!repo.objects.has(oid)) repo.objects.set(oid, { kind, bytes });
+    return oid;
+  }
+
+  /** Commit baru di atas parent tertentu; menyimpan objek, mengembalikan oid. */
+  makeCommit(
+    repo: RepoRecord,
+    treeOid: string,
+    parents: string[],
+    message: string,
+  ): string {
+    const who = this.viewerLogin();
+    const when = this.tick();
+    const bytes = encodeCommit({
+      tree: treeOid,
+      parents,
+      author: { name: who, email: `${who}@example.invalid`, when },
+      committer: { name: who, email: `${who}@example.invalid`, when },
+      message,
+    });
+    return this.storeObject(repo, 'commit', bytes);
+  }
+
+  /** Tip sebuah branch (atau null bila branch belum ada). */
+  branchTip(repo: RepoRecord, branch: string): string | null {
+    return repo.refs.get(`refs/heads/${branch}`) ?? null;
+  }
+
+  /** Semua branch: nama pendek -> tip. */
+  listBranches(repo: RepoRecord): { name: string; sha: string }[] {
+    const out: { name: string; sha: string }[] = [];
+    for (const [ref, sha] of repo.refs) {
+      if (ref.startsWith('refs/heads/')) out.push({ name: ref.slice('refs/heads/'.length), sha });
     }
-    const build = (node: Node): string => {
-      const entries: Array<{ mode: string; name: string; oid: string }> = [];
-      for (const [name, entry] of node.files) entries.push({ mode: entry.mode, name, oid: entry.oid });
-      for (const [name, child] of node.dirs) entries.push({ mode: '40000', name, oid: build(child) });
-      const data = buildTree(entries);
-      const oid = hashObject('tree', data);
-      if (!repo.objects.has(oid)) repo.objects.set(oid, { type: 'tree', data });
+    out.sort((a, b) => (a.name < b.name ? -1 : 1));
+    return out;
+  }
+
+  /** Semua tag: nama pendek -> { oid, target }. */
+  listTags(repo: RepoRecord): { name: string; oid: string; target: string | null }[] {
+    const out: { name: string; oid: string; target: string | null }[] = [];
+    for (const [ref, oid] of repo.refs) {
+      if (!ref.startsWith('refs/tags/')) continue;
+      const obj = repo.objects.get(oid);
+      let target: string | null = null;
+      if (obj !== undefined && obj.kind === 'tag') target = decodeTag(obj.bytes).object;
+      else if (obj !== undefined) target = oid;
+      out.push({ name: ref.slice('refs/tags/'.length), oid, target });
+    }
+    out.sort((a, b) => (a.name < b.name ? -1 : 1));
+    return out;
+  }
+
+  /**
+   * Selesaikan sebuah ref: nama branch, oid penuh, atau nama ref lengkap.
+   * Mengembalikan oid commit atau null.
+   */
+  resolveRef(repo: RepoRecord, ref: string): string | null {
+    if (/^[0-9a-f]{40}$/.test(ref)) {
+      const obj = repo.objects.get(ref);
+      if (obj === undefined) return null;
+      if (obj.kind === 'commit') return ref;
+      if (obj.kind === 'tag') return decodeTag(obj.bytes).object;
+      return null;
+    }
+    if (ref.startsWith('refs/')) {
+      const oid = repo.refs.get(ref);
+      if (oid === undefined) return null;
+      const obj = repo.objects.get(oid);
+      if (obj?.kind === 'tag') return decodeTag(obj.bytes).object;
       return oid;
-    };
-    return build(root);
-  }
-
-  /** The flat file map at a commit, or an empty map for an unborn branch. */
-  filesAt(repo: Repo, commitOid: string | null): Map<string, { oid: string; mode: string }> {
-    if (commitOid === null) return new Map();
-    const object = repo.objects.get(commitOid);
-    if (object === undefined || object.type !== 'commit') return new Map();
-    return this.flatTree(repo, parseCommit(object.data).tree);
-  }
-
-  commitObject(repo: Repo, commitOid: string): { tree: string; parents: string[] } | null {
-    const object = repo.objects.get(commitOid);
-    if (object === undefined || object.type !== 'commit') return null;
-    const parsed = parseCommit(object.data);
-    return { tree: parsed.tree, parents: parsed.parents };
-  }
-
-  /** The first commit reachable from both `headSha` and `baseSha` (linear histories: the branch point). */
-  mergeBase(repo: Repo, headSha: string, baseSha: string): string | null {
-    const baseAncestors = new Set<string>();
-    const stack = [baseSha];
-    while (stack.length > 0) {
-      const current = stack.pop() as string;
-      if (baseAncestors.has(current)) continue;
-      baseAncestors.add(current);
-      const commit = this.commitObject(repo, current);
-      if (commit === null) continue;
-      for (const parent of commit.parents) stack.push(parent);
     }
-    const queue = [headSha];
-    const seen = new Set<string>();
-    while (queue.length > 0) {
-      const current = queue.shift() as string;
-      if (baseAncestors.has(current)) return current;
-      if (seen.has(current)) continue;
-      seen.add(current);
-      const commit = this.commitObject(repo, current);
-      if (commit === null) continue;
-      for (const parent of commit.parents) queue.push(parent);
-    }
+    const tip = this.branchTip(repo, ref);
+    if (tip !== null) return tip;
     return null;
   }
 
-  /** The path-level diff between two trees (merge-base -> head). */
-  diffTrees(repo: Repo, baseTreeOid: string, headTreeOid: string): FileChange[] {
-    const base = this.flatTree(repo, baseTreeOid);
-    const head = this.flatTree(repo, headTreeOid);
-    const changes: FileChange[] = [];
-    const paths = new Set([...base.keys(), ...head.keys()]);
-    for (const path of [...paths].sort()) {
-      const oldEntry = base.get(path);
-      const newEntry = head.get(path);
-      if (oldEntry !== undefined && newEntry === undefined) {
-        changes.push({ path, status: 'removed', oldOid: oldEntry.oid, newOid: null });
-      } else if (oldEntry === undefined && newEntry !== undefined) {
-        changes.push({ path, status: 'added', oldOid: null, newOid: newEntry.oid });
-      } else if (oldEntry !== undefined && newEntry !== undefined && oldEntry.oid !== newEntry.oid) {
-        changes.push({ path, status: 'modified', oldOid: oldEntry.oid, newOid: newEntry.oid });
-      }
-    }
-    return changes;
+  /** Pesan commit (persis seperti tersimpan). */
+  commitMessage(repo: RepoRecord, oid: string): string | null {
+    const obj = repo.objects.get(oid);
+    if (obj === undefined || obj.kind !== 'commit') return null;
+    return decodeCommit(obj.bytes).message;
   }
 
-  /** Commits reachable from `tip`, newest first (first-parent walk, then by parent order). */
-  listCommits(repo: Repo, tip: string | null): string[] {
-    if (tip === null) return [];
+  /** Daftar commit dari tip, terbaru dulu (urutan jalan parent pertama). */
+  listCommits(repo: RepoRecord, tip: string): string[] {
     const out: string[] = [];
     const seen = new Set<string>();
-    const stack = [tip];
-    while (stack.length > 0) {
-      const current = stack.pop() as string;
-      if (seen.has(current)) continue;
-      seen.add(current);
-      const commit = this.commitObject(repo, current);
-      if (commit === null) continue;
-      out.push(current);
-      for (let i = commit.parents.length - 1; i >= 0; i -= 1) stack.push(commit.parents[i] as string);
+    const queue = [tip];
+    while (queue.length > 0) {
+      const oid = queue.shift()!;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const obj = repo.objects.get(oid);
+      if (obj === undefined) continue;
+      if (obj.kind === 'tag') {
+        queue.push(decodeTag(obj.bytes).object);
+        continue;
+      }
+      if (obj.kind !== 'commit') continue;
+      out.push(oid);
+      queue.push(...decodeCommit(obj.bytes).parents);
     }
     return out;
   }
+}
 
-  createBranch(repo: Repo, branch: string, sha: string): boolean {
-    const ref = this.refName(branch);
-    if (repo.refs.has(ref)) return false;
-    if (!repo.objects.has(sha)) return false;
-    repo.refs.set(ref, sha);
-    return true;
+// ---------------------------------------------------------------------------
+// Operasi file (contents API) — di atas objek git yang sama
+// ---------------------------------------------------------------------------
+
+export interface PutFileResult {
+  commitOid: string;
+  blobOid: string;
+  created: boolean;
+  branch: string;
+}
+
+export class ForgeStoreContents {
+  private store: ForgeStore;
+  constructor(store: ForgeStore) {
+    this.store = store;
   }
 
-  // ------------------------------------------------------------- contents API
-
-  commitFile(
-    repo: Repo,
-    options: { branch?: string; path: string; content: Buffer; message: string; sha?: string },
-  ): { status: 201 | 200; commitSha: string; contentSha: string } | { status: 409; message: string } {
-    const branch = options.branch ?? repo.defaultBranch;
-    let tip = this.branchTip(repo, branch);
-    if (tip === null && branch !== repo.defaultBranch) {
-      // A write on a branch that does not exist yet starts from the default branch tip.
-      tip = this.defaultTip(repo);
-      if (tip !== null) repo.refs.set(this.refName(branch), tip);
-    }
-    const flat = this.filesAt(repo, tip);
-    const existing = flat.get(options.path);
-    if (options.sha !== undefined) {
-      if (existing === undefined || existing.oid.toLowerCase() !== options.sha.toLowerCase()) {
-        return { status: 409, message: 'sha does not match the current blob' };
-      }
-    }
-    const contentSha = hashObject('blob', options.content);
-    if (!repo.objects.has(contentSha)) repo.objects.set(contentSha, { type: 'blob', data: options.content });
-    const created = existing === undefined;
-    flat.set(options.path, { oid: contentSha, mode: '100644' });
-    const treeOid = this.buildTreeFromFlat(repo, flat);
-    const stamp = this.stamp();
-    const identity = `${VIEWER.name} <${VIEWER.email}> ${stamp.epochSec} +0000`;
-    const parents = tip === null ? [] : [tip];
-    const commitData = buildCommit({ tree: treeOid, parents, author: identity, committer: identity, message: options.message });
-    const commitSha = hashObject('commit', commitData);
-    repo.objects.set(commitSha, { type: 'commit', data: commitData });
-    repo.refs.set(this.refName(branch), commitSha);
-    repo.updatedAt = stamp.iso;
-    return { status: created ? 201 : 200, commitSha, contentSha };
+  private lookup(repo: RepoRecord) {
+    return this.store.lookup(repo);
   }
 
+  /** Tree tip sebuah branch, atau null bila branch belum ada. */
+  branchTree(repo: RepoRecord, branch: string): string | null {
+    const tip = this.store.branchTip(repo, branch);
+    if (tip === null) return null;
+    const obj = repo.objects.get(tip);
+    if (obj === undefined || obj.kind !== 'commit') return null;
+    return decodeCommit(obj.bytes).tree;
+  }
+
+  /**
+   * Tulis file. Bila branch belum ada, dibuat dari tip default (atau dari
+   * nol bila repo masih kosong). Mengembalikan commit + blob baru.
+   */
+  putFile(
+    repo: RepoRecord,
+    branch: string,
+    path: string,
+    content: Buffer,
+    message: string,
+  ): PutFileResult {
+    const lookup = this.lookup(repo);
+    const existingTip = this.store.branchTip(repo, branch);
+    const baseTree =
+      existingTip !== null
+        ? this.branchTree(repo, branch)
+        : this.branchTree(repo, repo.defaultBranch);
+    const wasPresent =
+      baseTree !== null && treeGetPath(baseTree, path, lookup) !== null;
+    const blobOid = this.store.storeObject(repo, 'blob', content);
+    const newTree = treeSetPath(baseTree, path, blobOid, '100644', lookup, repo.objects);
+    const parents = existingTip !== null ? [existingTip] : [];
+    const commitOid = this.store.makeCommit(repo, newTree, parents, message);
+    repo.refs.set(`refs/heads/${branch}`, commitOid);
+    return { commitOid, blobOid, created: !wasPresent, branch };
+  }
+
+  /** Hapus file. Null bila file/branch tidak ada. */
   deleteFile(
-    repo: Repo,
-    options: { branch?: string; path: string; message: string; sha?: string },
-  ): { status: 200; commitSha: string } | { status: 404 | 409; message: string } {
-    const branch = options.branch ?? repo.defaultBranch;
-    const tip = this.branchTip(repo, branch);
-    if (tip === null) return { status: 404, message: 'Not Found' };
-    const flat = this.filesAt(repo, tip);
-    const existing = flat.get(options.path);
-    if (existing === undefined) return { status: 404, message: 'Not Found' };
-    if (options.sha !== undefined && existing.oid.toLowerCase() !== options.sha.toLowerCase()) {
-      return { status: 409, message: 'sha does not match the current blob' };
+    repo: RepoRecord,
+    branch: string,
+    path: string,
+    message: string,
+  ): { commitOid: string } | null {
+    const lookup = this.lookup(repo);
+    const tip = this.store.branchTip(repo, branch);
+    if (tip === null) return null;
+    const tree = this.branchTree(repo, branch);
+    if (tree === null) return null;
+    const nextTree = treeRemovePath(tree, path, lookup, repo.objects);
+    if (nextTree === null) return null;
+    const commitOid = this.store.makeCommit(repo, nextTree, [tip], message);
+    repo.refs.set(`refs/heads/${branch}`, commitOid);
+    return { commitOid };
+  }
+
+  /** Baca blob di sebuah path pada ref tertentu. */
+  readPath(
+    repo: RepoRecord,
+    ref: string,
+    path: string,
+  ): { mode: string; oid: string; bytes: Buffer } | null {
+    const commitOid = this.store.resolveRef(repo, ref);
+    if (commitOid === null) return null;
+    const obj = repo.objects.get(commitOid);
+    if (obj === undefined || obj.kind !== 'commit') return null;
+    const tree = decodeCommit(obj.bytes).tree;
+    const found = treeGetPath(tree, path, this.lookup(repo));
+    if (found === null || found.mode === '40000') return null;
+    const blob = repo.objects.get(found.oid);
+    if (blob === undefined || blob.kind !== 'blob') return null;
+    return { mode: found.mode, oid: found.oid, bytes: blob.bytes };
+  }
+
+  /** Daftar direktori pada ref tertentu. */
+  listDir(
+    repo: RepoRecord,
+    ref: string,
+    path: string,
+  ): { name: string; path: string; mode: string; oid: string }[] | null {
+    const commitOid = this.store.resolveRef(repo, ref);
+    if (commitOid === null) return null;
+    const obj = repo.objects.get(commitOid);
+    if (obj === undefined || obj.kind !== 'commit') return null;
+    const tree = decodeCommit(obj.bytes).tree;
+    const entries = treeListDir(tree, path, this.lookup(repo));
+    if (entries === null) return null;
+    const prefix = path === '' ? '' : path.replace(/\/$/, '') + '/';
+    return entries.map((e) => ({
+      name: e.name,
+      path: prefix + e.name,
+      mode: e.mode,
+      oid: e.oid,
+    }));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Diff & merge
+// ---------------------------------------------------------------------------
+
+function countLines(text: string): string[] {
+  if (text === '') return [];
+  const parts = text.split('\n');
+  if (parts[parts.length - 1] === '') parts.pop();
+  return parts;
+}
+
+/** Hitung tambahan/hapusan baris antara dua isi (perbedaan multiset baris). */
+function lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
+  const oldLines = countLines(oldText);
+  const newLines = countLines(newText);
+  const oldCount = new Map<string, number>();
+  for (const line of oldLines) oldCount.set(line, (oldCount.get(line) ?? 0) + 1);
+  let additions = 0;
+  for (const line of newLines) {
+    const left = oldCount.get(line) ?? 0;
+    if (left > 0) oldCount.set(line, left - 1);
+    else additions += 1;
+  }
+  let deletions = 0;
+  for (const left of oldCount.values()) deletions += left;
+  return { additions, deletions };
+}
+
+function flattenTree(
+  repo: RepoRecord,
+  treeOid: string,
+  prefix: string,
+  out: Map<string, { mode: string; oid: string }>,
+): void {
+  const obj = repo.objects.get(treeOid);
+  if (obj === undefined || obj.kind !== 'tree') return;
+  for (const entry of decodeTree(obj.bytes)) {
+    const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.mode === '40000') flattenTree(repo, entry.oid, path, out);
+    else out.set(path, { mode: entry.mode, oid: entry.oid });
+  }
+}
+
+/** Diff dua tree: daftar perubahan per path. */
+export function diffTrees(
+  repo: RepoRecord,
+  baseTreeOid: string | null,
+  headTreeOid: string | null,
+): FileChange[] {
+  const base = new Map<string, { mode: string; oid: string }>();
+  const head = new Map<string, { mode: string; oid: string }>();
+  if (baseTreeOid !== null) flattenTree(repo, baseTreeOid, '', base);
+  if (headTreeOid !== null) flattenTree(repo, headTreeOid, '', head);
+  const paths = new Set([...base.keys(), ...head.keys()]);
+  const changes: FileChange[] = [];
+  for (const path of [...paths].sort()) {
+    const b = base.get(path);
+    const h = head.get(path);
+    if (b !== undefined && h === undefined) {
+      changes.push({ path, status: 'removed', oldOid: b.oid, newOid: null, additions: 0, deletions: countLines(repo.objects.get(b.oid)?.bytes.toString('utf8') ?? '').length });
+    } else if (b === undefined && h !== undefined) {
+      const text = repo.objects.get(h.oid)?.bytes.toString('utf8') ?? '';
+      changes.push({ path, status: 'added', oldOid: null, newOid: h.oid, additions: countLines(text).length, deletions: 0 });
+    } else if (b !== undefined && h !== undefined && b.oid !== h.oid) {
+      const oldText = repo.objects.get(b.oid)?.bytes.toString('utf8') ?? '';
+      const newText = repo.objects.get(h.oid)?.bytes.toString('utf8') ?? '';
+      const { additions, deletions } = lineDiff(oldText, newText);
+      changes.push({ path, status: 'modified', oldOid: b.oid, newOid: h.oid, additions, deletions });
     }
-    flat.delete(options.path);
-    const treeOid = this.buildTreeFromFlat(repo, flat);
-    const stamp = this.stamp();
-    const identity = `${VIEWER.name} <${VIEWER.email}> ${stamp.epochSec} +0000`;
-    const commitData = buildCommit({ tree: treeOid, parents: [tip], author: identity, committer: identity, message: options.message });
-    const commitSha = hashObject('commit', commitData);
-    repo.objects.set(commitSha, { type: 'commit', data: commitData });
-    repo.refs.set(this.refName(branch), commitSha);
-    repo.updatedAt = stamp.iso;
-    return { status: 200, commitSha };
+  }
+  return changes;
+}
+
+export interface MergeOutcome {
+  ok: boolean;
+  sha: string | null;
+  conflict: boolean;
+}
+
+export class ForgeStoreMerge {
+  private store: ForgeStore;
+  constructor(store: ForgeStore) {
+    this.store = store;
   }
 
-  // ------------------------------------------------------------------- labels
-
-  createLabel(repo: Repo, name: string, color: string): Label {
-    const existing = repo.labels.get(name);
-    if (existing !== undefined) return existing;
-    const label: Label = { id: this.nextLabelId, name, color: color ?? 'ededed', description: '' };
-    this.nextLabelId += 1;
-    repo.labels.set(name, label);
-    return label;
+  private treeOf(repo: RepoRecord, commitOid: string): string | null {
+    const obj = repo.objects.get(commitOid);
+    if (obj === undefined || obj.kind !== 'commit') return null;
+    return decodeCommit(obj.bytes).tree;
   }
 
-  // ------------------------------------------------------------------- issues
-
-  createIssue(repo: Repo, title: string, body: string, labelNames: string[]): Issue | { error: string } {
-    for (const name of labelNames) {
-      if (!repo.labels.has(name)) return { error: `label ${name} does not exist` };
-    }
-    const stamp = this.stamp();
-    const issue: Issue = {
-      id: this.nextIssueId,
-      number: repo.nextIssueNumber,
-      title,
-      body: body ?? '',
-      state: 'open',
-      labels: [...labelNames],
-      createdSeq: stamp.seq,
-      createdAt: stamp.iso,
-      updatedAt: stamp.iso,
-      comments: [],
-    };
-    this.nextIssueId += 1;
-    repo.nextIssueNumber += 1;
-    repo.issues.push(issue);
-    return issue;
-  }
-
-  issueByGlobalId(id: string): { repo: Repo; issue: Issue } | undefined {
-    const parsed = parseGlobalId(id);
-    if (parsed === null || parsed.kind !== 'issue') return undefined;
-    const repoId = Number(parsed.parts[0]);
-    const number = Number(parsed.parts[1]);
-    if (!Number.isInteger(repoId) || !Number.isInteger(number)) return undefined;
-    for (const repo of this.repos.values()) {
-      if (repo.id !== repoId) continue;
-      const issue = repo.issues.find((entry) => entry.number === number);
-      if (issue !== undefined) return { repo, issue };
-    }
-    return undefined;
-  }
-
-  addComment(repo: Repo, issue: Issue, body: string): Comment {
-    const stamp = this.stamp();
-    const comment: Comment = { id: this.nextCommentId, body, createdSeq: stamp.seq, createdAt: stamp.iso };
-    this.nextCommentId += 1;
-    issue.comments.push(comment);
-    issue.updatedAt = stamp.iso;
-    return comment;
-  }
-
-  // --------------------------------------------------------------------- pulls
-
-  createPull(repo: Repo, head: string, base: string, title: string, body: string): Pull | { error: string } {
-    const headSha = this.branchTip(repo, head);
-    const baseSha = this.branchTip(repo, base);
-    if (headSha === null) return { error: `head branch ${head} does not exist` };
-    if (baseSha === null) return { error: `base branch ${base} does not exist` };
-    const stamp = this.stamp();
-    const pull: Pull = {
-      id: this.nextPullId,
-      number: repo.nextPullNumber,
-      title,
-      body: body ?? '',
-      state: 'open',
-      headRef: head,
-      baseRef: base,
-      headSha,
-      baseSha,
-      merged: false,
-      mergedAt: null,
-      mergeCommitSha: null,
-      createdSeq: stamp.seq,
-      createdAt: stamp.iso,
-      updatedAt: stamp.iso,
-    };
-    this.nextPullId += 1;
-    repo.nextPullNumber += 1;
-    repo.pulls.push(pull);
-    return pull;
-  }
-
-  pullByGlobalId(id: string): { repo: Repo; pull: Pull } | undefined {
-    const parsed = parseGlobalId(id);
-    if (parsed === null || parsed.kind !== 'pr') return undefined;
-    const repoId = Number(parsed.parts[0]);
-    const number = Number(parsed.parts[1]);
-    if (!Number.isInteger(repoId) || !Number.isInteger(number)) return undefined;
-    for (const repo of this.repos.values()) {
-      if (repo.id !== repoId) continue;
-      const pull = repo.pulls.find((entry) => entry.number === number);
-      if (pull !== undefined) return { repo, pull };
-    }
-    return undefined;
-  }
-
-  /** MERGEABLE when the head's changes apply cleanly onto the base tip, else CONFLICTING. */
-  mergeable(repo: Repo, pull: Pull): 'MERGEABLE' | 'CONFLICTING' {
-    const baseSha = this.branchTip(repo, pull.baseRef) ?? pull.baseSha;
-    const headSha = this.branchTip(repo, pull.headRef) ?? pull.headSha;
-    const mb = this.mergeBase(repo, headSha, baseSha);
-    if (mb === null) return 'CONFLICTING';
-    const mbCommit = this.commitObject(repo, mb);
-    const headCommit = this.commitObject(repo, headSha);
-    const baseCommit = this.commitObject(repo, baseSha);
-    if (mbCommit === null || headCommit === null || baseCommit === null) return 'CONFLICTING';
-    const mbFlat = this.flatTree(repo, mbCommit.tree);
-    const headFlat = this.flatTree(repo, headCommit.tree);
-    const baseFlat = this.flatTree(repo, baseCommit.tree);
-    for (const change of this.diffTrees(repo, mbCommit.tree, headCommit.tree)) {
-      const baseOid = baseFlat.get(change.path)?.oid ?? null;
-      const mbOid = mbFlat.get(change.path)?.oid ?? null;
-      const headOid = headFlat.get(change.path)?.oid ?? null;
-      if (baseOid !== mbOid && baseOid !== headOid) return 'CONFLICTING';
+  /** Apakah merge squash PR ini akan konflik? */
+  mergeable(repo: RepoRecord, pull: PullRecord): 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' {
+    if (pull.state !== 'open') return 'UNKNOWN';
+    const baseTip = this.store.branchTip(repo, pull.baseRef);
+    if (baseTip === null) return 'UNKNOWN';
+    const headObj = repo.objects.get(pull.headSha);
+    if (headObj === undefined || headObj.kind !== 'commit') return 'UNKNOWN';
+    const base = mergeBase(pull.headSha, baseTip, this.store.lookup(repo));
+    const baseTree = base === null ? null : this.treeOf(repo, base);
+    const headTree = this.treeOf(repo, pull.headSha);
+    const tipTree = this.treeOf(repo, baseTip);
+    const headChanges = diffTrees(repo, baseTree, headTree);
+    const baseChanges = diffTrees(repo, baseTree, tipTree);
+    const baseByPath = new Map(baseChanges.map((c) => [c.path, c]));
+    for (const change of headChanges) {
+      const other = baseByPath.get(change.path);
+      if (other === undefined) continue;
+      if (change.newOid !== other.newOid) return 'CONFLICTING';
     }
     return 'MERGEABLE';
   }
 
-  /** Squash-merge a pull request onto its base branch. */
-  mergePull(repo: Repo, pull: Pull): { commitSha: string } | { error: string } {
-    if (pull.state !== 'open') return { error: 'pull request is not open' };
-    if (this.mergeable(repo, pull) !== 'MERGEABLE') return { error: 'merge conflict' };
-    const baseSha = this.branchTip(repo, pull.baseRef) as string;
-    const headSha = this.branchTip(repo, pull.headRef) as string;
-    const mb = this.mergeBase(repo, headSha, baseSha) as string;
-    const mbCommit = this.commitObject(repo, mb) as { tree: string; parents: string[] };
-    const headCommit = this.commitObject(repo, headSha) as { tree: string; parents: string[] };
-    const baseCommit = this.commitObject(repo, baseSha) as { tree: string; parents: string[] };
-    const baseFlat = this.flatTree(repo, baseCommit.tree);
-    for (const change of this.diffTrees(repo, mbCommit.tree, headCommit.tree)) {
-      if (change.status === 'removed') baseFlat.delete(change.path);
-      else if (change.newOid !== null) baseFlat.set(change.path, { oid: change.newOid, mode: '100644' });
+  /**
+   * Lakukan squash merge: terapkan perubahan head ke atas tip base,
+   * commit baru ber-parent tunggal (tip base), geser branch base.
+   */
+  merge(repo: RepoRecord, pull: PullRecord): MergeOutcome {
+    if (pull.state !== 'open' || pull.merged) {
+      return { ok: false, sha: null, conflict: false };
     }
-    const treeOid = this.buildTreeFromFlat(repo, baseFlat);
-    const stamp = this.stamp();
-    const identity = `${VIEWER.name} <${VIEWER.email}> ${stamp.epochSec} +0000`;
-    const message = `Merge pull request #${pull.number} from ${VIEWER.login}/${pull.headRef}`;
-    const commitData = buildCommit({ tree: treeOid, parents: [baseSha], author: identity, committer: identity, message });
-    const commitSha = hashObject('commit', commitData);
-    repo.objects.set(commitSha, { type: 'commit', data: commitData });
-    repo.refs.set(this.refName(pull.baseRef), commitSha);
+    const baseTip = this.store.branchTip(repo, pull.baseRef);
+    if (baseTip === null) return { ok: false, sha: null, conflict: false };
+    const state = this.mergeable(repo, pull);
+    if (state === 'CONFLICTING') return { ok: false, sha: null, conflict: true };
+    if (state === 'UNKNOWN') return { ok: false, sha: null, conflict: false };
+    const base = mergeBase(pull.headSha, baseTip, this.store.lookup(repo));
+    const baseTree = base === null ? null : this.treeOf(repo, base);
+    const headTree = this.treeOf(repo, pull.headSha);
+    const tipTree = this.treeOf(repo, baseTip);
+    const headChanges = diffTrees(repo, baseTree, headTree);
+    // Terapkan perubahan head ke tree tip base, satu per satu.
+    let resultTree = tipTree;
+    const lookup = this.store.lookup(repo);
+    for (const change of headChanges) {
+      if (change.newOid === null) {
+        if (resultTree !== null) {
+          const next = treeRemovePath(resultTree, change.path, lookup, repo.objects);
+          if (next !== null) resultTree = next;
+        }
+      } else {
+        resultTree = treeSetPath(resultTree, change.path, change.newOid, '100644', lookup, repo.objects);
+      }
+    }
+    if (resultTree === null) {
+      const empty = encodeTree([]);
+      resultTree = objectId('tree', empty);
+      repo.objects.set(resultTree, { kind: 'tree', bytes: empty });
+    }
+    const message = pull.title;
+    const sha = this.store.makeCommit(repo, resultTree, [baseTip], message);
+    repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
     pull.state = 'closed';
     pull.merged = true;
-    pull.mergedAt = stamp.iso;
-    pull.mergeCommitSha = commitSha;
-    pull.updatedAt = stamp.iso;
-    repo.updatedAt = stamp.iso;
-    return { commitSha };
+    pull.mergedAt = new Date(this.store.tick() * 1000).toISOString();
+    pull.mergeCommitSha = sha;
+    return { ok: true, sha, conflict: false };
   }
 
-  /** The changed files of a pull request (merge-base -> head tip). */
-  pullFiles(repo: Repo, pull: Pull): FileChange[] {
-    const headSha = this.branchTip(repo, pull.headRef) ?? pull.headSha;
-    const baseSha = this.branchTip(repo, pull.baseRef) ?? pull.baseSha;
-    const mb = this.mergeBase(repo, headSha, baseSha);
-    if (mb === null) return [];
-    const mbCommit = this.commitObject(repo, mb);
-    const headCommit = this.commitObject(repo, headSha);
-    if (mbCommit === null || headCommit === null) return [];
-    return this.diffTrees(repo, mbCommit.tree, headCommit.tree);
-  }
-
-  /** Objects reachable from the repo's refs (what a clone serves). */
-  reachableObjects(repo: Repo): Set<string> {
-    const tips = [...repo.refs.values()];
-    try {
-      return collectReachable(tips, this.lookup(repo));
-    } catch {
-      return new Set<string>();
-    }
-  }
-
-  /** Whether `ancestor` is reachable from `oid` inside this repo. */
-  isAncestorOf(repo: Repo, ancestor: string, oid: string): boolean {
-    return isAncestor(ancestor, oid, this.lookup(repo));
-  }
-
-  /** Peel an annotated tag to its target commit (or return the oid unchanged). */
-  peel(repo: Repo, oid: string): string {
-    const object = repo.objects.get(oid);
-    if (object === undefined || object.type !== 'tag') return oid;
-    return this.peel(repo, parseTag(object.data).object);
+  /** File yang diubah PR: diff merge-base -> head. */
+  filesOf(repo: RepoRecord, pull: PullRecord): FileChange[] {
+    const baseTip = this.store.branchTip(repo, pull.baseRef);
+    const base = baseTip === null ? null : mergeBase(pull.headSha, baseTip, this.store.lookup(repo));
+    const baseTree = base === null ? null : this.treeOf(repo, base);
+    const headTree = this.treeOf(repo, pull.headSha);
+    return diffTrees(repo, baseTree, headTree);
   }
 }
 
-export { b64encode };
+// ---------------------------------------------------------------------------
+// Issue & PR helpers (dipakai REST, GraphQL, MCP)
+// ---------------------------------------------------------------------------
+
+export class ForgeStoreIssues {
+  private store: ForgeStore;
+  constructor(store: ForgeStore) {
+    this.store = store;
+  }
+
+  createIssue(
+    repo: RepoRecord,
+    title: string,
+    body: string,
+    labelNames: string[],
+  ): { issue: IssueRecord } | { error: string } {
+    for (const name of labelNames) {
+      if (!repo.labels.has(name)) return { error: `label tidak dikenal: ${name}` };
+    }
+    const number = repo.nextNumber++;
+    const issue: IssueRecord = {
+      id: this.store.allocIssueId(),
+      number,
+      title,
+      body,
+      state: 'open',
+      labels: [...labelNames],
+      seq: number,
+      comments: [],
+    };
+    repo.issues.push(issue);
+    return { issue };
+  }
+
+  createPull(
+    repo: RepoRecord,
+    title: string,
+    body: string,
+    headRef: string,
+    baseRef: string,
+  ): { pull: PullRecord } | { error: string } {
+    const headSha = this.store.branchTip(repo, headRef);
+    if (headSha === null) return { error: `head tidak ada: ${headRef}` };
+    const baseSha = this.store.branchTip(repo, baseRef);
+    if (baseSha === null) return { error: `base tidak ada: ${baseRef}` };
+    const dup = repo.pulls.find(
+      (p) => p.state === 'open' && p.headRef === headRef && p.baseRef === baseRef,
+    );
+    if (dup) return { error: 'pull request sudah terbuka untuk branch ini' };
+    const number = repo.nextNumber++;
+    const pull: PullRecord = {
+      id: this.store.allocPullId(),
+      number,
+      title,
+      body,
+      state: 'open',
+      merged: false,
+      mergedAt: null,
+      mergeCommitSha: null,
+      headRef,
+      headSha,
+      baseRef,
+      baseSha,
+      seq: number,
+    };
+    repo.pulls.push(pull);
+    return { pull };
+  }
+
+  addComment(repo: RepoRecord, issue: IssueRecord, body: string): CommentRecord {
+    const comment: CommentRecord = {
+      id: repo.nextCommentId++,
+      body,
+      seq: repo.nextCommentId,
+    };
+    issue.comments.push(comment);
+    return comment;
+  }
+}
